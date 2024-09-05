@@ -1,0 +1,243 @@
+name: (Reusable) Edit repository files and project structure then commit changes
+
+# Doc: https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions
+on:
+  workflow_call:
+    inputs:
+      target-repository:
+        required: true
+        type: string
+      first-simple-search-and-replace:
+        required: false
+        type: string
+        default: '[]'
+      second-vault-key-value-replace:
+        required: false
+        type: string
+        default: '[]'
+      third-raw-shell-commands:
+        required: false
+        type: string
+        default: '[]'
+      auto-merge:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      VAULT_ADDR:
+        required: true
+      VAULT_GH_ORGANIZATION_ROLE_ROLE_ID:
+        required: true
+      VAULT_GH_ORGANIZATION_ROLE_SECRET_ID:
+        required: true
+
+jobs:
+  one-time-setup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: If needed - Prepare additional secrets to ask from the vault for replace step 2
+        if: inputs.second-vault-key-value-replace != '[]'
+        run: |
+          # Sanitize vault-search-and-replace inputs
+          vault_search_replace=$(echo '${{ inputs.second-vault-key-value-replace }}' | jq -R 'fromjson? | . as $in | $in | tostring | fromjson')
+          echo "$vault_search_replace" | jq '.' > vault_search_replace.json
+          vault_search_replace=$(cat vault_search_replace.json)
+
+          # Initialize a variable to store dynamic secrets input
+               dynamic_secrets=""
+               count=0
+
+          # Extract secrets and register them as environment variables
+          while IFS= read -r entry; do
+            vault_path=$(echo "$entry" | jq -r '.vault')
+            env_var=$(echo "$entry" | jq -r '.env')
+
+            # Register each secret path as its own environment variable
+            echo "Registering secret: ${vault_path} as ${env_var}"
+            echo "${env_var}=${vault_path} | ${env_var} ;" >> $GITHUB_ENV
+
+            # Append each entry to the dynamic secrets string for the vault-action input
+            dynamic_secrets="${dynamic_secrets}${vault_path} | ${env_var} ;"$'\n'
+            echo "Secret in loop: $dynamic_secrets"
+            count=$((count + 1))
+          done < <(echo "$vault_search_replace" | jq -c '.[]')
+
+          # Check if any secrets were processed
+          if [ "$count" -eq 0 ]; then
+            echo "No secrets extracted. Check the input formatting or jq command."
+            exit 1
+          fi
+
+          # Set the dynamic secrets as an output for later use
+          echo "dynamic_secrets<<EOF" >> $GITHUB_ENV
+          echo "$dynamic_secrets" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Import Secrets
+        id: import-secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          method: approle
+          roleId: ${{ secrets.VAULT_GH_ORGANIZATION_ROLE_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_GH_ORGANIZATION_ROLE_SECRET_ID }}
+          namespace: admin/${{ github.repository_owner }}
+          secrets: |
+            kv/data/discord webhook | DISCORD_WEBHOOK ;
+            kv/data/github organization-pat | GITHUB_ORGANIZATION_PAT ;
+            kv/data/github organization-name | GITHUB_ORGANIZATION_NAME ;
+            kv/data/github ssh-private-key | GITHUB_AUTOMATION_SSH_PRIVATE_KEY ;
+            ${{ env.dynamic_secrets }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target-repository }}
+          ref: 'main'
+          token: ${{ env.GITHUB_ORGANIZATION_PAT }}
+
+      - name: Sanitize JSON like search-and-replace input
+        run: |
+
+
+      - name: Step 1 - Simple search and replace
+        if: inputs.first-simple-search-and-replace != '[]'
+        run: |
+          # Sanitize JSON like input
+          search_replace=$(echo '${{ inputs.first-simple-search-and-replace }}' | jq -R 'fromjson? | . as $in | $in | tostring | fromjson')
+          echo "$search_replace" | jq '.' > search_and_replace.json
+          search_replace=$(cat search_and_replace.json)
+          rm search_and_replace.json
+          echo "$search_replace" | jq -c '.[]' | while read -r entry; do
+            file=$(echo "$entry" | jq -r '.file')
+            search=$(echo "$entry" | jq -r '.search')
+            replace=$(echo "$entry" | jq -r '.replace')
+            if [ -f "$file" ]; then
+              sed -i "s|$search|$replace|g" "$file"
+            else
+              echo "$file not found."
+              exit 1
+            fi
+          done
+
+      - name: Step 2 - Vault key values search and replace
+        if: inputs.second-vault-key-value-replace != '[]'
+        run: |
+          vault_search_replace=$(echo '${{ inputs.second-vault-key-value-replace }}' | jq -R 'fromjson? | . as $in | $in | tostring | fromjson')
+          echo "$vault_search_replace" | jq '.' > vault_search_replace.json
+          vault_search_replace=$(cat vault_search_replace.json)
+          rm vault_search_replace.json
+          echo "$vault_search_replace" | jq -c '.[]' | while read -r entry; do
+            file=$(echo "$entry" | jq -r '.file')
+            search=$(echo "$entry" | jq -r '.search')
+            env_var=$(echo "$entry" | jq -r '.env')
+            echo "env_var $env_var"
+            replace=${!env_var} # Use indirect variable reference to get the value from environment
+          
+            if [ -f "$file" ]; then
+              # Escape special characters in the replace variable
+              escaped_replace=$(printf '%s\n' "$replace" | sed 's/[&/\]/\\&/g')
+
+              # Use awk to replace while preserving conditional newlines
+              awk -v search="$search" -v replace="$escaped_replace" '
+                BEGIN { RS = ORS = "" }
+                {
+                  # Check the surrounding content for newlines
+                  if (match($0, search)) {
+                    # Extract before and after the match
+                    pre = substr($0, 1, RSTART - 1)
+                    post = substr($0, RSTART + RLENGTH)
+
+                    # Detect existing newline context
+                    newline_before = (pre ~ /\n$/) ? "\n" : ""
+                    newline_after = (post ~ /^\n/) ? "\n" : ""
+
+                    # Perform replacement with conditional newlines
+                    gsub(search, newline_before replace newline_after)
+                  }
+                }
+                1' "$file" > temp_file && mv temp_file "$file"
+            else
+              echo "$file not found."
+              exit 1
+            fi
+          done
+
+      - name: Step 3 - Raw shell commands
+        if: inputs.third-raw-shell-commands != '[]'
+        run: |
+          # Sanitize JSON like input
+          raw_commands=$(echo '${{ inputs.third-raw-shell-commands }}' | jq -R 'fromjson? | . as $in | $in | tostring | fromjson')
+          echo "$raw_commands" | jq '.' > raw_commands.json 
+          raw_commands=$(cat raw_commands.json)
+          rm raw_commands.json
+          echo "$raw_commands" | jq -c '.[]' | while read -r entry; do
+            command=$(echo "$entry" | jq -r '.command')
+            echo "Running: $command"
+            $command
+          done
+
+      - name: Commit Changes & create or update pull request
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Clean and create the working branch
+          git branch -D one-time-setup >/dev/null 2>&1 || true
+          git checkout -b one-time-setup
+          
+          # Check if there are any changes
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          # Commit and push the changes
+          git add .
+          git commit -m "feat: replaced template text with default values"
+          git push origin one-time-setup --force
+          
+          # Create / Update pull request
+          PR_URL=$(gh pr list --head one-time-setup --json url --jq '.[0].url')
+          if [ -z "$PR_URL" ]; then
+            gh pr create --base main --head one-time-setup --title "Initial Setup" --body "Modified files according to workflow"
+          else
+            echo "PR already exists: $PR_URL"
+            gh pr edit "$PR_URL" --body "Modified files according to workflow"
+          fi
+        env:
+          GH_TOKEN: ${{ env.GITHUB_ORGANIZATION_PAT }}
+
+      - name: Merge pull request if exist and auto-merge is true
+        if: inputs.auto-merge
+        run: |
+          pr_number=$(gh pr list --state open --head one-time-setup --json number --jq '.[0].number')
+          if [ -n "$pr_number" ]; then
+            gh pr merge $pr_number --merge --repo ${{ github.repository }} --admin
+          else
+            echo "No pull request found to merge"
+          fi
+        env:
+          GH_TOKEN: ${{ env.GITHUB_ORGANIZATION_PAT }}
+
+      - name: Notify on Error
+        if: ${{ always() && failure() }}
+        uses: Ilshidur/action-discord@0.3.2
+        with:
+          args: Failure - Setup ${{ inputs.target-repository }}
+        env:
+          DISCORD_WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+          DISCORD_USERNAME: Failure Bot
+
+      - name: Notify on Success
+        if: ${{ always() && success() }}
+        uses: Ilshidur/action-discord@0.3.2
+        with:
+          args: Success - Setup ${{ inputs.target-repository }}
+        env:
+          DISCORD_WEBHOOK: ${{ env.DISCORD_WEBHOOK }}
+          DISCORD_USERNAME: Success Bot
